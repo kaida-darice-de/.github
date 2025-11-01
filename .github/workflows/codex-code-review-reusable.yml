@@ -1,0 +1,310 @@
+name: Codex Code Review (Reusable)
+
+# This is a REUSABLE workflow that can be called from any repository in your organization
+# Deploy this to your organization's .github repository
+
+on:
+  workflow_call:
+    inputs:
+      review_depth:
+        description: 'Review depth (quick, standard, thorough)'
+        required: false
+        default: 'standard'
+        type: string
+      files_pattern:
+        description: 'File patterns to review (space-separated globs)'
+        required: false
+        default: '**/*.py **/*.js **/*.ts **/*.tsx **/*.go **/*.rs **/*.java **/*.tf **/*.yml **/*.yaml'
+        type: string
+      files_ignore:
+        description: 'File patterns to ignore'
+        required: false
+        default: '**/*.md **/*.txt **/*.json **/package-lock.json **/pnpm-lock.yaml **/*.log'
+        type: string
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      GITHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  codex-review:
+    name: Codex Interactive Code Review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch base branch
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }}
+
+      - name: Install Codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          safety-strategy: read-only
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v42
+        with:
+          files: ${{ inputs.files_pattern }}
+          files_ignore: ${{ inputs.files_ignore }}
+
+      - name: Run Codex code review
+        if: steps.changed-files.outputs.any_changed == 'true'
+        id: review
+        run: |
+          DEPTH="${{ inputs.review_depth }}"
+
+          if [ "$DEPTH" = "quick" ]; then
+            FOCUS="Focus on critical security issues and bugs only."
+            MAX_FILES=10
+          elif [ "$DEPTH" = "thorough" ]; then
+            FOCUS="Perform a comprehensive review including architecture, patterns, testing, and documentation."
+            MAX_FILES=50
+          else
+            FOCUS="Review security, performance, code quality, and best practices."
+            MAX_FILES=25
+          fi
+
+          CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+          FILE_COUNT=$(echo "$CHANGED_FILES" | wc -w)
+
+          echo "Reviewing $FILE_COUNT file(s) with $DEPTH depth..."
+
+          cat > /tmp/review-schema.json << 'EOF'
+{
+  "type": "object",
+  "properties": {
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "file_path": {"type": "string"},
+          "overall_score": {"type": "integer", "minimum": 0, "maximum": 100},
+          "summary": {"type": "string"},
+          "critical_issues": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "line": {"type": "integer"},
+                "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                "category": {"type": "string"},
+                "description": {"type": "string"},
+                "suggestion": {"type": "string"},
+                "code_snippet": {"type": "string"}
+              }
+            }
+          },
+          "security_issues": {"type": "array"},
+          "performance_issues": {"type": "array"},
+          "code_quality_issues": {"type": "array"},
+          "best_practices": {"type": "array"},
+          "suggestions": {"type": "array"}
+        }
+      }
+    },
+    "overall_assessment": {
+      "type": "object",
+      "properties": {
+        "total_score": {"type": "integer"},
+        "recommendation": {"type": "string"},
+        "highlights": {"type": "array", "items": {"type": "string"}},
+        "concerns": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}
+EOF
+
+          codex exec \
+            --output-schema-file /tmp/review-schema.json \
+            --output-file /tmp/codex-review-results.json \
+            "
+Review the code changes in this pull request.
+
+PR Title: ${{ github.event.pull_request.title }}
+PR Description: ${{ github.event.pull_request.body }}
+
+Changed files ($(echo $CHANGED_FILES | wc -w) files):
+$CHANGED_FILES
+
+Base branch: ${{ github.event.pull_request.base.ref }}
+Head branch: ${{ github.event.pull_request.head.ref }}
+
+Review Instructions:
+1. Analyze each changed file in detail
+2. $FOCUS
+3. Compare changes against the base branch
+4. Provide specific line-by-line feedback
+5. Suggest improvements with code examples where appropriate
+
+Review Criteria:
+- Security: SQL injection, XSS, auth issues, secrets exposure
+- Performance: N+1 queries, inefficient algorithms, memory leaks
+- Code Quality: Maintainability, readability, complexity
+- Best Practices: Language idioms, framework patterns, project conventions
+- Testing: Test coverage, test quality, edge cases
+- Documentation: Code comments, API docs, README updates
+
+Output Format:
+Return a structured JSON review following the provided schema.
+Focus on actionable, specific feedback with concrete suggestions.
+
+Review Depth: $DEPTH
+"
+
+          if [ -f /tmp/codex-review-results.json ]; then
+            echo "review_completed=true" >> $GITHUB_OUTPUT
+          else
+            echo "review_completed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Format review results
+        if: steps.review.outputs.review_completed == 'true'
+        id: format
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+import json
+import os
+
+with open('/tmp/codex-review-results.json', 'r') as f:
+    review = json.load(f)
+
+md = "## 🤖 Codex Code Review\n\n"
+
+if 'overall_assessment' in review:
+    assessment = review['overall_assessment']
+    score = assessment.get('total_score', 0)
+
+    if score >= 90:
+        badge = "🟢 Excellent"
+    elif score >= 75:
+        badge = "🟡 Good"
+    elif score >= 60:
+        badge = "🟠 Needs Improvement"
+    else:
+        badge = "🔴 Significant Issues"
+
+    md += f"**Overall Score:** {score}/100 {badge}\n\n"
+
+    if assessment.get('recommendation'):
+        md += f"**Recommendation:** {assessment['recommendation']}\n\n"
+
+    if assessment.get('highlights'):
+        md += "### ✨ Highlights\n\n"
+        for highlight in assessment['highlights']:
+            md += f"- {highlight}\n"
+        md += "\n"
+
+    if assessment.get('concerns'):
+        md += "### ⚠️ Concerns\n\n"
+        for concern in assessment['concerns']:
+            md += f"- {concern}\n"
+        md += "\n"
+
+if 'files' in review:
+    md += "### 📁 File Reviews\n\n"
+
+    for file_review in review['files']:
+        file_path = file_review.get('file_path', 'Unknown')
+        file_score = file_review.get('overall_score', 0)
+        summary = file_review.get('summary', '')
+
+        md += f"#### `{file_path}`\n\n"
+        md += f"**Score:** {file_score}/100\n\n"
+
+        if summary:
+            md += f"{summary}\n\n"
+
+        critical = file_review.get('critical_issues', [])
+        if critical:
+            md += "##### 🔴 Critical Issues\n\n"
+            for issue in critical[:5]:
+                line = issue.get('line', '?')
+                desc = issue.get('description', '')
+                suggestion = issue.get('suggestion', '')
+                category = issue.get('category', 'general')
+
+                md += f"**Line {line}** [{category}]: {desc}\n"
+                if suggestion:
+                    md += f"> **Suggestion:** {suggestion}\n"
+                if issue.get('code_snippet'):
+                    md += f"```\n{issue['code_snippet']}\n```\n"
+                md += "\n"
+
+        security = file_review.get('security_issues', [])
+        if security:
+            md += "##### 🛡️ Security Issues\n\n"
+            for issue in security[:3]:
+                md += f"- {issue.get('description', '')}\n"
+            md += "\n"
+
+        performance = file_review.get('performance_issues', [])
+        if performance:
+            md += "##### ⚡ Performance Issues\n\n"
+            for issue in performance[:3]:
+                md += f"- {issue.get('description', '')}\n"
+            md += "\n"
+
+        practices = file_review.get('best_practices', [])
+        if practices:
+            md += "##### 📚 Best Practices\n\n"
+            for practice in practices[:3]:
+                md += f"- {practice.get('description', '')}\n"
+            md += "\n"
+
+        md += "---\n\n"
+
+md += "\n*Powered by [OpenAI Codex](https://openai.com/index/codex/) via organization-wide reusable workflow*\n"
+
+with open('/tmp/codex-review-summary.md', 'w') as f:
+    f.write(md)
+
+print("Review summary created successfully")
+PYTHON_SCRIPT
+
+      - name: Post review comment
+        if: steps.review.outputs.review_completed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('/tmp/codex-review-summary.md', 'utf8');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: summary
+            });
+
+      - name: Upload review artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-review-results
+          path: |
+            /tmp/codex-review-results.json
+            /tmp/codex-review-summary.md
+          retention-days: 30
+
+      - name: Review summary
+        if: steps.review.outputs.review_completed == 'true'
+        run: |
+          echo "✅ Codex code review completed successfully"
+          cat /tmp/codex-review-summary.md
