@@ -1,0 +1,27 @@
+name: Codex CI Autofix
+
+on:
+  workflow_run:
+    workflows: ["CI", "Test", "Build", "Tests"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  checks: read
+
+jobs:
+  codex-autofix:
+    name: Auto-fix CI Failures
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    uses: kaida-darice-de/.github/.github/workflows/codex-ci-autofix-reusable.yml@main
+    with:
+      failed_workflow_id: ${{ github.event.workflow_run.id }}
+      failed_workflow_name: ${{ github.event.workflow_run.name }}
+      head_branch: ${{ github.event.workflow_run.head_branch }}
+      head_sha: ${{ github.event.workflow_run.head_sha }}
+      safety_strategy: 'drop-sudo'
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
